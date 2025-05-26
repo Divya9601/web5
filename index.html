@@ -1,3 +1,221 @@
+<!--<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MultiSet VPS Localization WebXR Demo</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+        }
+
+        #ar-button {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            padding: 10px 20px;
+            background: #0078ff;
+            color: white;
+            font-weight: bold;
+            border: none;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+    <button id="ar-button">Start AR Session</button>
+    <script type="module">
+
+        import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.153.0/build/three.module.js';
+
+        let renderer, scene, camera, xrSession;
+        let frameBuffer, gl;
+        let canvas;
+
+        async function initXR() {
+            if (!navigator.xr) {
+                alert('WebXR not supported');
+                return;
+            }
+
+            try {
+                xrSession = await navigator.xr.requestSession('immersive-ar', { requiredFeatures: ['camera-access'] });
+            } catch (e) {
+                alert('Failed to start AR session: ' + e);
+                return;
+            }
+
+            // Setup THREE.js renderer with XR support
+            canvas = document.createElement('canvas');
+            document.body.appendChild(canvas);
+            gl = canvas.getContext('webgl', { xrCompatible: true });
+            renderer = new THREE.WebGLRenderer({ canvas, context: gl, alpha: true });
+            renderer.xr.enabled = true;
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.setSession(xrSession);
+
+            scene = new THREE.Scene();
+
+            // Simple cube to visualize localization result
+            const geometry = new THREE.BoxGeometry(0.1, 0.1, 0.1);
+            const material = new THREE.MeshNormalMaterial();
+            const cube = new THREE.Mesh(geometry, material);
+            cube.name = 'localizeCube';
+            scene.add(cube);
+
+            camera = new THREE.PerspectiveCamera();
+
+            // Prepare XRWebGLBinding to get camera image
+            const xrGlBinding = new XRWebGLBinding(xrSession, gl);
+
+            // Start the animation loop
+            xrSession.requestAnimationFrame(onXRFrame);
+
+            // Use reference space
+            const refSpace = await xrSession.requestReferenceSpace('local');
+
+            async function onXRFrame(time, frame) {
+                const session = frame.session;
+                session.requestAnimationFrame(onXRFrame);
+
+                const pose = frame.getViewerPose(refSpace);
+                if (!pose) return;
+
+                // Grab first view (typically the user's camera)
+                const view = pose.views[0];
+
+                // Get camera intrinsics
+                const intrinsics = getCameraIntrinsics(view.projectionMatrix, view.viewport);
+
+                // Get camera image as a WebGL texture
+                const cameraTexture = xrGlBinding.getCameraImage();
+
+                // Capture image pixels from texture
+                const imageData = await captureImageFromTexture(cameraTexture, gl);
+
+                // Prepare formData for localization
+                const formData = new FormData();
+                formData.append('fx', intrinsics.fx);
+                formData.append('fy', intrinsics.fy);
+                formData.append('px', intrinsics.px);
+                formData.append('py', intrinsics.py);
+                formData.append('imageWidth', imageData.width);
+                formData.append('imageHeight', imageData.height);
+                formData.append('queryImage', imageData.blob, 'frame.jpg');
+
+                // Your client credentials
+                formData.append('client_id', 'f67b6749-bf5b-42b5-b8a2-5ec3836503d4');
+                formData.append('client_secret', '3fd6c23ddcdcd6d58f3db3e3688c55a2fb587439a3f1d9f66ae90eb85a9df3a9');
+
+                // Map ID and coordinate system
+                formData.append('mapId', 'MAP_F1FZ9ANANFAC');
+                formData.append('isRightHanded', 'true');
+
+                // Call MultiSet VPS Localization API
+                try {
+                    const localizationResult = await queryLocalizationAPI(formData);
+                    updateSceneWithLocalization(cube, localizationResult);
+                } catch (err) {
+                    console.error('Localization error:', err);
+                }
+
+                // Render scene
+                renderer.render(scene, camera);
+            }
+        }
+
+        function getCameraIntrinsics(projectionMatrix, viewport) {
+            const p = projectionMatrix;
+            const u0 = ((1 - p[8]) * viewport.width) / 2 + viewport.x;
+            const v0 = ((1 - p[9]) * viewport.height) / 2 + viewport.y;
+            const ax = (viewport.width / 2) * p[0];
+            const ay = (viewport.height / 2) * p[5];
+            return { fx: ax, fy: ay, px: u0, py: v0 };
+        }
+
+        async function captureImageFromTexture(texture, gl) {
+            const width = texture.width;
+            const height = texture.height;
+
+            // Create framebuffer and bind texture
+            const fb = gl.createFramebuffer();
+            gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+
+            // Read pixels
+            const pixels = new Uint8Array(width * height * 4);
+            gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+
+            // Cleanup
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+            gl.deleteFramebuffer(fb);
+
+            // Flip pixels vertically
+            const flippedPixels = new Uint8Array(width * height * 4);
+            for (let y = 0; y < height; y++) {
+                const srcStart = y * width * 4;
+                const destStart = (height - y - 1) * width * 4;
+                flippedPixels.set(pixels.subarray(srcStart, srcStart + width * 4), destStart);
+            }
+
+            // Draw to canvas to get Blob
+            const canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext('2d');
+            const imgData = ctx.createImageData(width, height);
+            imgData.data.set(flippedPixels);
+            ctx.putImageData(imgData, 0, 0);
+
+            return new Promise(resolve => {
+                canvas.toBlob(blob => {
+                    resolve({ blob, width, height });
+                }, 'image/jpeg', 0.9);
+            });
+        }
+
+        async function queryLocalizationAPI(formData) {
+            const response = await fetch('https://api.multiset.com/vps/localize', {
+                method: 'POST',
+                body: formData
+            });
+
+            if (!response.ok) {
+                const errorText = await response.text();
+                throw new Error('API error: ' + response.status + ' - ' + errorText);
+            }
+            return response.json();
+        }
+
+        function updateSceneWithLocalization(cube, localizationData) {
+            if (!localizationData.position || !localizationData.rotation) {
+                console.warn('Invalid localization data:', localizationData);
+                return;
+            }
+
+            // Position and rotation from API
+            const pos = localizationData.position;
+            const rot = localizationData.rotation;
+
+            // Apply position
+            cube.position.set(pos.x, pos.y, pos.z);
+
+            // Apply rotation quaternion
+            cube.quaternion.set(rot.x, rot.y, rot.z, rot.w);
+        }
+
+        // Button to start AR session
+        document.getElementById('ar-button').addEventListener('click', () => {
+            initXR();
+            document.getElementById('ar-button').style.display = 'none';
+        });
+
+    </script>
+</body>
+</html>
+</html>-->
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -11,7 +229,7 @@
             background: #000;
         }
 
-        #ar-button, #localize-button {
+        #ar-button {
             position: absolute;
             top: 20px;
             left: 20px;
@@ -22,16 +240,11 @@
             border: none;
             cursor: pointer;
             z-index: 10000;
-            margin-bottom: 10px;
-        }
-
-        #localize-button {
-            top: 60px;
         }
 
         #notification {
             position: absolute;
-            top: 110px;
+            top: 70px;
             left: 20px;
             color: #aaffaa;
             background: rgba(0,0,0,0.7);
@@ -45,21 +258,25 @@
         }
 
         video, canvas {
-            display: none;
+            position: absolute;
+            bottom: 0;
+            right: 0;
+            width: 160px;
+            height: auto;
+            z-index: 100;
+            background: #000;
         }
     </style>
 </head>
 <body>
-    <button id="ar-button">Start Camera</button>
-    <button id="localize-button" style="display: none;">Send Localization</button>
+    <button id="ar-button">Start AR Session</button>
     <div id="notification">Waiting to start...</div>
 
-    <video id="camera-video" autoplay playsinline></video>
+    <video id="camera-video" autoplay muted playsinline></video>
     <canvas id="capture-canvas"></canvas>
 
     <script type="module">
         const button = document.getElementById('ar-button');
-        const localizeButton = document.getElementById('localize-button');
         const notification = document.getElementById('notification');
         const video = document.getElementById('camera-video');
         const canvas = document.getElementById('capture-canvas');
@@ -71,47 +288,58 @@
             console.log(msg);
         }
 
+        async function waitForVideoDimensions() {
+            return new Promise((resolve) => {
+                const check = () => {
+                    if (video.videoWidth > 0 && video.videoHeight > 0) {
+                        resolve();
+                    } else {
+                        requestAnimationFrame(check);
+                    }
+                };
+                check();
+            });
+        }
+
         async function startCamera() {
             try {
-                const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: 'environment' }
+                });
                 video.srcObject = stream;
                 await video.play();
-                showNotification('Camera stream started');
+                await waitForVideoDimensions();
+
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+
+                showNotification(`Camera stream started (${video.videoWidth}x${video.videoHeight})`);
             } catch (e) {
                 showNotification('Camera error: ' + e.message, true);
-                console.error('Camera error:', e);
                 throw e;
             }
         }
 
         function captureFrame() {
-            if (!video.videoWidth || !video.videoHeight) {
-                showNotification('Video not ready', true);
-                throw new Error('Video dimensions not available');
-            }
-
-            canvas.width = video.videoWidth;
-            canvas.height = video.videoHeight;
             ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-            return new Promise((resolve, reject) => {
+            return new Promise((resolve) => {
                 canvas.toBlob(blob => {
                     if (!blob) {
                         showNotification('Failed to capture frame as blob', true);
-                        reject(new Error('Blob creation failed'));
                         return;
                     }
-                    resolve({ blob, width: canvas.width, height: canvas.height });
+                    resolve({
+                        blob,
+                        width: canvas.width,
+                        height: canvas.height
+                    });
                 }, 'image/jpeg', 0.9);
             });
         }
 
         async function sendLocalizationRequest(imageData) {
             showNotification('Sending localization request...');
-
-            const client_id = 'f67b6749-bf5b-42b5-b8a2-5ec3836503d4';
-            const client_secret = '3fd6c23ddcdcd6d58f3db3e3688c55a2fb587439a3f1d9f66ae90eb85a9df3a9';
-            const mapId = 'MAP_WNXIFBW3VGZD';
 
             const formData = new FormData();
             formData.append('fx', '1000');
@@ -121,9 +349,9 @@
             formData.append('imageWidth', imageData.width.toString());
             formData.append('imageHeight', imageData.height.toString());
             formData.append('queryImage', imageData.blob, 'frame.jpg');
-            formData.append('client_id', client_id);
-            formData.append('client_secret', client_secret);
-            formData.append('mapId', mapId);
+            formData.append('client_id', 'f67b6749-bf5b-42b5-b8a2-5ec3836503d4');
+            formData.append('client_secret', '3fd6c23ddcdcd6d58f3db3e3688c55a2fb587439a3f1d9f66ae90eb85a9df3a9');
+            formData.append('mapId', 'MAP_CC3MMTRYKP67');
             formData.append('isRightHanded', 'true');
 
             try {
@@ -132,41 +360,23 @@
                     body: formData
                 });
 
-                const responseText = await response.text();
-
                 if (!response.ok) {
-                    console.error("Server responded with error:", responseText);
-                    throw new Error(`API error ${response.status}: ${responseText}`);
+                    const errorText = await response.text();
+                    console.error('Server responded with error:', errorText);
+                    throw new Error(`API error ${response.status}: ${errorText}`);
                 }
 
-                const data = JSON.parse(responseText);
+                const data = await response.json();
                 showNotification('Localization success!\n' + JSON.stringify(data, null, 2));
                 console.log('Localization data:', data);
             } catch (e) {
-                console.error('Localization error:', e);
+                console.error('Localization request failed:', e);
                 showNotification('Localization request failed:\n' + e.message, true);
             }
         }
 
-        button.addEventListener('click', async () => {
-            try {
-                showNotification('Starting camera...');
-                await startCamera();
-                button.style.display = 'none';
-                localizeButton.style.display = 'inline-block';
-            } catch (e) {
-                // handled already
-            }
-        });
 
-        localizeButton.addEventListener('click', async () => {
-            try {
-                const imageData = await captureFrame();
-                await sendLocalizationRequest(imageData);
-            } catch (e) {
-                console.error('Manual capture/localization error:', e);
-            }
-        });
     </script>
 </body>
 </html>
+
