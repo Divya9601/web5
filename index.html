@@ -1,4 +1,4 @@
-<!--<!DOCTYPE html>
+﻿<!--<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8" />
@@ -375,7 +375,20 @@
             }
         }
 
+        // 🔴 This is what was missing!
+        button.addEventListener('click', async () => {
+            showNotification('Starting camera...');
+            try {
+                await startCamera();
 
+                showNotification('Capturing frame...');
+                const frame = await captureFrame();
+
+                await sendLocalizationRequest(frame);
+            } catch (e) {
+                console.error('AR session error:', e);
+            }
+        });
     </script>
 </body>
 </html>
